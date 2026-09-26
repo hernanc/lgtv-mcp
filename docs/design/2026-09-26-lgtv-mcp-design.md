@@ -52,8 +52,9 @@ src/lgtv_mcp/
 tests/
 ```
 
-Dependencies: `aiowebostv` (Apache-2.0, Home Assistant's LG client) and `mcp`
-(MIT, official SDK, 2.x `MCPServer` API). No other runtime dependencies.
+Dependencies: `aiowebostv` (Apache-2.0, Home Assistant's LG client), `mcp`
+(MIT, official SDK, 2.x `MCPServer` API), plus `aiohttp` and `pydantic`, which
+those already pull in but which we import directly and so declare.
 
 ### Units
 
@@ -76,10 +77,14 @@ files are left in place.
   `LOCATION` URL, so a hostile device on the LAN cannot steer us to another
   host. Responses are capped at 4 KiB.
 - `reachable(host) -> bool`: TCP connect to 3000 with a short timeout.
-- `validate_host(host) -> str`: accepts an IP literal or hostname, resolves
-  it, and rejects anything that is not private, link-local or loopback
-  (RFC 1918, RFC 4193, 169.254/16, fe80::/10, 127/8, ::1). This stops a prompt
-  injection from pointing `pair_tv` at an internet host.
+- `validate_host(host) -> str`: accepts an IPv4 literal (IPv4-mapped IPv6 is
+  unwrapped) or a hostname resolved over IPv4, and requires every address to
+  be in an explicit allowlist: 10/8, 172.16/12, 192.168/16, 169.254/16
+  (except 169.254.169.254) and 127/8. `ipaddress.is_private` is not used
+  because its meaning changed between Python patch releases. IPv6 is out of
+  scope: webOS TVs are reached over IPv4. This stops a prompt injection from
+  pointing `pair_tv` at an internet host. An async wrapper runs the DNS
+  lookup in a thread.
 - `wake_on_lan(macs, host)`: validates each MAC and sends the magic packet
   (UDP 9) to the limited broadcast `255.255.255.255` and unicast to the TV's
   last known IP. We do not guess a subnet directed broadcast.
@@ -102,26 +107,37 @@ candidates (capped at 10).
 caller what to do next.
 
 **control.py**. `TvController(entry: TvEntry)` wraps one `WebOsClient`.
-- `connect()`: resolve host (saved host if reachable, else SSDP lookup by
-  UUID, then update config), connect with the stored key, map library
-  exceptions to `LgtvError`.
+- `connect()`: use the saved host if reachable. Otherwise, if SSDP finds a
+  device claiming the TV's UUID at another address, raise `TvMoved` and do
+  not connect: the UUID is broadcast in the clear, so a hostile device could
+  claim it and would receive the key. A person confirms the new address with
+  `lgtv move` or the `set_tv_address` tool. Map library exceptions to
+  `LgtvError`, and close the client on any failure, cancellation included.
 - Operations: `status()`, `info()`, `apps()`, `inputs()`, `launch(name)`,
   `switch_input(name)`, `youtube(value)`, `set_volume(level)`,
   `step_volume(up)`, `set_mute(muted)`, `set_screen(on)`, `power_off()`,
   `press(keys)`, `toast(text)`. Return plain dataclasses or dicts.
-- `pair(host) -> TvEntry`: connect without key, wait for the user to accept,
+- `pair(host) -> TvEntry`: connect without key, wait up to 60 s for the user
+  to accept (aiowebostv's own limit is 10 s, so it is raised while pairing),
   read key, UUID, model and both MAC addresses (Wi-Fi and wired) from the
   TV. Wake-on-LAN targets both, since the TV does not say which is active.
 - A `ControllerPool` (used by the MCP server) keeps one lazily connected
-  controller per TV, reconnects once on a dropped connection, applies a
-  per-call timeout (5 s, pairing 60 s) and closes everything on shutdown.
+  controller per TV, reconnects and retries once on a dropped connection
+  (never for key sequences or volume steps, which are unsafe to repeat),
+  applies a per-call timeout (20 s, pairing 60 s) and closes everything on
+  shutdown. A TV refusing a request is reported as such, not as a dropped
+  connection. Pairing jobs are registered before any await, so a name cannot
+  be paired twice at once, and an existing name is only overwritten with
+  `replace`.
   The CLI creates a controller per invocation.
 
 **cli.py** (`lgtv`). Subcommands: `discover`, `pair HOST [--name N]
-[--default]`, `list`, `default NAME`, `remove NAME`, `status`, `info`, `apps`,
+[--default] [--replace]`, `move NAME HOST`, `list`, `default NAME`,
+`remove NAME`, `status`, `info`, `apps`,
 `inputs`, `app NAME`, `input NAME`, `yt URL_OR_ID`, `vol [N|up|down]`,
 `mute`, `unmute`, `screen on|off`, `on`, `off`, `key KEY...`, `msg TEXT...`.
-Global `--tv NAME` and `--version`. Errors print `lgtv: message` to stderr,
+Global `--tv NAME`, `--json` (every command prints JSON) and `--version`;
+option abbreviations are disabled. Errors print `lgtv: message` to stderr,
 exit code 1. A `--` is inserted before a lone `yt` argument so ids starting
 with `-` parse.
 
@@ -132,8 +148,9 @@ with `-` parse.
 |---|---|
 | `list_tvs` | read-only |
 | `discover_tvs` | read-only, open-world |
-| `pair_tv(host, name, make_default=False)` | starts background pairing, returns immediately |
+| `pair_tv(host, name, make_default=False, replace=False)` | starts background pairing, returns immediately |
 | `pair_tv_status(name)` | read-only |
+| `set_tv_address(name, host)` | destructive: sends the key to a new address |
 | `get_status`, `get_tv_info`, `list_apps`, `list_inputs` | read-only |
 | `power(state: "on" \| "off")` | destructive (off) |
 | `set_screen(on: bool)` | |
@@ -164,8 +181,9 @@ MCP client --stdio--> server.py tool --> ControllerPool --> TvController
   on 3001 without certificate checks, because LG TVs use self-signed
   certificates. Traffic on the LAN is therefore not authenticated. The README
   says so plainly.
-- **Network scope**: only private, link-local or loopback hosts are accepted
-  for pairing and connections. SSDP `LOCATION` URLs are never fetched.
+- **Network scope**: only allowlisted private, link-local or loopback IPv4
+  hosts are accepted for pairing and connections. SSDP `LOCATION` URLs are
+  never fetched. A moved TV is never followed without confirmation.
 - **Input validation**: all tool and CLI inputs are validated before reaching
   the TV (names, lengths, key whitelist, volume range, MAC format, YouTube
   host whitelist).
@@ -185,6 +203,8 @@ MCP client --stdio--> server.py tool --> ControllerPool --> TvController
 | No TV configured | No TV paired yet. Run discover_tvs, then pair_tv. |
 | Unknown TV name | No TV named 'x'. Known: a, b. |
 | Unreachable | TV 'x' is not reachable (last seen 1.2.3.4). It may be off or on another network. |
+| Moved | TV 'x' is not at A, but a device claiming to be it answered at B. Confirm with lgtv move or set_tv_address. |
+| Refused | The TV rejected the request. |
 | TV off | TV 'x' is off. Use power on first. |
 | Pairing cancelled | Pairing was cancelled or timed out on the TV. Retry while someone is at the TV. |
 | 401 | The TV denied permission for this action. |
@@ -199,7 +219,8 @@ MCP client --stdio--> server.py tool --> ControllerPool --> TvController
 - MCP tests through the SDK's in-memory client: tool list, schemas,
   annotations, error mapping, a few end-to-end calls on the fake client.
 - Ruff (lint and format) and mypy strict on `src/`.
-- CI: GitHub Actions matrix on Python 3.11, 3.12, 3.13, ubuntu and macOS.
+- CI: GitHub Actions matrix on Python 3.11, 3.12, 3.13, on Linux, macOS and
+  Windows.
 - Manual smoke checklist in `CONTRIBUTING.md` for a real TV.
 
 ## Repository
