@@ -683,9 +683,11 @@ async def test_pool_does_not_close_a_controller_in_use(
     network: Network, paired: TvEntry, cfg_path: Path
 ) -> None:
     release = asyncio.Event()
+    in_flight = asyncio.Event()
 
     class Slow(FakeClient):
         async def launch_app(self, app_id: str) -> dict[str, Any]:
+            in_flight.set()
             await release.wait()
             if not self.connected:  # the real client cancels pending replies on disconnect
                 raise asyncio.CancelledError
@@ -693,7 +695,7 @@ async def test_pool_does_not_close_a_controller_in_use(
 
     pool = ControllerPool(cfg_path, client_factory=Slow)
     first = asyncio.create_task(pool.run(None, lambda c: c.launch("netflix")))
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(in_flight.wait(), 5)
     config.update(lambda c: c.add("living", replace(paired, key="rotated")), cfg_path)
     second = asyncio.create_task(pool.run(None, lambda c: c.launch("youtube")))
     await asyncio.sleep(0.01)
@@ -800,14 +802,18 @@ async def test_pool_without_retry_runs_once(
 async def test_connect_cleans_up_on_cancellation(
     network: Network, paired: TvEntry, cfg_path: Path
 ) -> None:
+    started = asyncio.Event()
+
     class HangingClient(FakeClient):
         async def connect(self) -> bool:
+            started.set()
             await asyncio.sleep(10)
             return True
 
     ctrl = TvController("living", paired, config_path=cfg_path, client_factory=HangingClient)
     task = asyncio.create_task(ctrl.connect())
-    await asyncio.sleep(0.01)
+    # Cancel only once the handshake is underway; host checks run in threads first.
+    await asyncio.wait_for(started.wait(), 5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -820,18 +826,21 @@ async def test_overlapping_pairings_restore_timeout(network: Network) -> None:
 
     before = webos_client.RECEIVE_TIMEOUT
     release = asyncio.Event()
+    both_waiting = asyncio.Event()
     seen: list[float] = []
 
     class GatedClient(FakeClient):
         async def connect(self) -> bool:
             seen.append(webos_client.RECEIVE_TIMEOUT)
+            if len(seen) == 2:
+                both_waiting.set()
             await release.wait()
             return await super().connect()
 
     first = asyncio.create_task(pair("192.168.4.40", client_factory=GatedClient))
-    await asyncio.sleep(0.01)
     second = asyncio.create_task(pair("192.168.4.40", client_factory=GatedClient))
-    await asyncio.sleep(0.01)
+    # Both pairings must be inside the window at once for this to test overlap.
+    await asyncio.wait_for(both_waiting.wait(), 5)
     release.set()
     await asyncio.gather(first, second)
     assert seen == [60, 60]
