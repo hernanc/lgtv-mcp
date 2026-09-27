@@ -1,7 +1,11 @@
 import asyncio
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
+import aiohttp
 import pytest
+from aiohttp import web
 from aiowebostv.exceptions import (
     WebOsTvCommandError,
     WebOsTvCommandTimeoutError,
@@ -92,7 +96,19 @@ async def test_rejected_key_asks_to_pair_again(
         await connected(paired, cfg_path)
 
 
-@pytest.mark.parametrize("error", [TimeoutError(), OSError("refused"), WebOsTvCommandError("x")])
+HANDSHAKE_CLOSED = aiohttp.WSMessageTypeError("Received message 8:1000 is not WSMsgType.TEXT")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError(),
+        OSError("refused"),
+        WebOsTvCommandError("x"),
+        HANDSHAKE_CLOSED,
+        KeyError("payload"),
+    ],
+)
 async def test_connect_failures_are_unreachable(
     network: Network, paired: TvEntry, cfg_path: Path, error: BaseException
 ) -> None:
@@ -113,6 +129,106 @@ async def test_backfills_identity_for_legacy_entries(network: Network, cfg_path:
     assert saved.model == "50UM7360"
     assert saved.macs == ["02:ab:cd:00:00:01", "02:ab:cd:00:00:02"]
     assert saved.key == "k"
+
+
+async def test_backfill_keeps_an_address_changed_meanwhile(
+    network: Network, cfg_path: Path
+) -> None:
+    config.update(lambda c: c.add("tv", TvEntry(host="192.168.4.40", key="k")), cfg_path)
+    ctrl = TvController(
+        "tv", config.load(cfg_path).tvs["tv"], config_path=cfg_path, client_factory=FakeClient
+    )
+
+    def moved(cfg: config.Config) -> None:  # `lgtv move` from another shell
+        cfg.tvs["tv"] = TvEntry(host="192.168.4.77", key="k")
+
+    config.update(moved, cfg_path)
+    await ctrl.connect()
+    saved = config.load(cfg_path).tvs["tv"]
+    assert saved.host == "192.168.4.77"
+    assert saved.uuid == TV_UUID
+
+
+async def test_saves_a_key_the_tv_issued_on_connect(
+    network: Network, paired: TvEntry, cfg_path: Path
+) -> None:
+    class Reprompted(FakeClient):  # the TV forgot the saved key and someone accepted again
+        async def connect(self) -> bool:
+            self.client_key = "issued-again"
+            return await super().connect()
+
+    pool = ControllerPool(cfg_path, client_factory=Reprompted)
+    await pool.run(None, lambda c: c.launch("netflix"))
+    await pool.run(None, lambda c: c.launch("youtube"))
+    assert config.load(cfg_path).tvs["living"].key == "issued-again"
+    assert len(FakeClient.instances) == 1
+    await pool.close()
+
+
+async def test_unwritable_config_does_not_force_reconnects(
+    network: Network, cfg_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config.update(lambda c: c.add("tv", TvEntry(host="192.168.4.40", key="k")), cfg_path)
+
+    def read_only(*_: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(config, "save", read_only)
+    pool = ControllerPool(cfg_path, client_factory=FakeClient)
+    for _ in range(3):
+        await pool.run(None, lambda c: c.launch("netflix"))
+    assert len(FakeClient.instances) == 1
+    await pool.close()
+
+
+async def test_refuses_a_different_tv_at_the_saved_address(
+    network: Network, paired: TvEntry, cfg_path: Path
+) -> None:
+    class OtherTv(FakeClient):
+        def __init__(self, host: str, client_key: str | None = None) -> None:
+            super().__init__(host, client_key)
+            self.tv_info.hello["deviceUUID"] = "another-tv"
+
+    ctrl = TvController("living", paired, config_path=cfg_path, client_factory=OtherTv)
+    with pytest.raises(Unreachable, match="not TV 'living'"):
+        await ctrl.connect()
+    assert not ctrl.is_connected
+    assert ("disconnect", None) in last_client().calls
+
+
+async def test_failed_network_search_still_reports_unreachable(
+    network: Network, paired: TvEntry, cfg_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    network.reachable_hosts = set()
+
+    def no_route(*_: object) -> list[Found]:
+        raise Unreachable("Cannot search the local network (No route to host).")
+
+    monkeypatch.setattr(control, "discover", no_route)
+    with pytest.raises(Unreachable, match=r"last seen at 192\.168\.4\.40"):
+        await connected(paired, cfg_path)
+
+
+async def test_default_client_stays_on_the_local_network() -> None:
+    async def redirect(_: web.Request) -> web.Response:
+        raise web.HTTPFound("http://8.8.8.8:3000/")
+
+    app = web.Application()
+    app.router.add_get("/", redirect)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", 0).start()
+    port = runner.addresses[0][1]
+    client = control._default_client("127.0.0.1", "k")
+    try:
+        with pytest.raises(aiohttp.ClientConnectionError, match="redirect"):
+            await client.client_session.ws_connect(f"http://127.0.0.1:{port}/")
+        with pytest.raises(aiohttp.ClientConnectionError, match="not on the local network"):
+            await client.client_session.ws_connect("ws://8.8.8.8:3000/")
+    finally:
+        await control._disconnect(client)
+        await runner.cleanup()
+    assert client.client_session.closed
 
 
 # --- reads ------------------------------------------------------------------------
@@ -299,6 +415,15 @@ async def test_power_on_uses_wake_on_lan_when_unreachable(
     assert network.woken == [(paired.macs, "192.168.4.40")]
 
 
+async def test_power_on_uses_wake_on_lan_when_the_handshake_breaks(
+    network: Network, paired: TvEntry, cfg_path: Path
+) -> None:
+    FakeClient.connect_error = HANDSHAKE_CLOSED  # booting TV closes the socket
+    ctrl = TvController("living", paired, config_path=cfg_path, client_factory=FakeClient)
+    assert "Wake-on-LAN" in await ctrl.power_on()
+    assert network.woken == [(paired.macs, "192.168.4.40")]
+
+
 async def test_press_keys(
     network: Network, paired: TvEntry, cfg_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -312,7 +437,7 @@ async def test_press_keys(
     ]
 
 
-@pytest.mark.parametrize("keys", [[], ["home"] * 21, ["home", "rm -rf"], ["HO\nME"]])
+@pytest.mark.parametrize("keys", [[], ["home"] * 21, ["home", "rm -rf"], ["HO\nME"], ["power"]])
 async def test_press_validation(
     network: Network, paired: TvEntry, cfg_path: Path, keys: list[str]
 ) -> None:
@@ -370,6 +495,79 @@ async def test_library_errors_are_mapped(
     assert "401" not in str(info.value)
 
 
+async def test_request_id_is_not_mistaken_for_a_401(
+    network: Network, paired: TvEntry, cfg_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctrl = await connected(paired, cfg_path)
+
+    async def server_error(*_: object) -> None:  # built like aiowebostv builds it
+        raise WebOsTvResponseTypeError(
+            {"type": "error", "id": 1401, "error": "500 Application error", "payload": {}}
+        )
+
+    monkeypatch.setattr(last_client(), "launch_app", server_error)
+    with pytest.raises(LgtvError, match="rejected") as info:
+        await ctrl.launch("netflix")
+    assert not isinstance(info.value, PermissionDenied)
+
+
+async def test_refusal_mentioning_not_connected_is_not_retried(
+    network: Network, paired: TvEntry, cfg_path: Path
+) -> None:
+    attempts = 0
+
+    class Refusing(FakeClient):
+        async def set_input(self, input_id: str) -> dict[str, Any]:
+            nonlocal attempts
+            attempts += 1
+            raise WebOsTvCommandError(
+                "Request failed with response {'payload': {'returnValue': False, "
+                "'errorText': 'Device is not connected'}}"
+            )
+
+    pool = ControllerPool(cfg_path, client_factory=Refusing)
+    with pytest.raises(Rejected):
+        await pool.run(None, lambda c: c.switch_input("ps5"))
+    assert attempts == 1
+    assert len(FakeClient.instances) == 1
+    await pool.close()
+
+
+class DroppedMidRequest(FakeClient):
+    """The socket closes while a reply is pending: aiowebostv cancels the reply future."""
+
+    async def launch_app(self, app_id: str) -> dict[str, Any]:
+        self.calls.append(("launch_app", app_id))
+        reply: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_soon(reply.cancel)
+        return await reply
+
+
+async def test_connection_dropped_mid_request_is_an_error_not_a_cancellation(
+    network: Network, paired: TvEntry, cfg_path: Path
+) -> None:
+    pool = ControllerPool(cfg_path, client_factory=DroppedMidRequest)
+    with pytest.raises(Unreachable, match="before it answered"):
+        await pool.run(None, lambda c: c.launch("netflix"))
+    # Not retried: the launch may already have reached the TV.
+    assert [c for c in last_client().calls if c[0] == "launch_app"] == [("launch_app", "netflix")]
+    await pool.close()
+
+
+async def test_timeout_during_a_request_still_times_out(
+    network: Network, paired: TvEntry, cfg_path: Path
+) -> None:
+    class NoReply(FakeClient):
+        async def launch_app(self, app_id: str) -> dict[str, Any]:
+            await asyncio.sleep(10)
+            return {}
+
+    pool = ControllerPool(cfg_path, client_factory=NoReply)
+    with pytest.raises(Unreachable, match="did not respond in time"):
+        await pool.run(None, lambda c: c.launch("netflix"), timeout=0.05)
+    await pool.close()
+
+
 # --- pairing ----------------------------------------------------------------------
 
 
@@ -396,6 +594,12 @@ async def test_pair_rejects_public_host(network: Network) -> None:
 async def test_pair_unreachable(network: Network) -> None:
     with pytest.raises(Unreachable):
         await pair("192.168.4.99", client_factory=FakeClient)
+
+
+async def test_pair_maps_a_closed_handshake(network: Network) -> None:
+    FakeClient.connect_error = HANDSHAKE_CLOSED
+    with pytest.raises(Unreachable, match="while pairing"):
+        await pair("192.168.4.40", client_factory=FakeClient)
 
 
 async def test_pairing_window_restores_timeout(network: Network) -> None:
@@ -472,6 +676,46 @@ async def test_pool_picks_up_repairing(network: Network, paired: TvEntry, cfg_pa
     await pool.run(None, lambda c: c.launch("netflix"))
     assert last_client().client_key == "rotated"
     assert not FakeClient.instances[0].connected
+    await pool.close()
+
+
+async def test_pool_does_not_close_a_controller_in_use(
+    network: Network, paired: TvEntry, cfg_path: Path
+) -> None:
+    release = asyncio.Event()
+
+    class Slow(FakeClient):
+        async def launch_app(self, app_id: str) -> dict[str, Any]:
+            await release.wait()
+            if not self.connected:  # the real client cancels pending replies on disconnect
+                raise asyncio.CancelledError
+            return await super().launch_app(app_id)
+
+    pool = ControllerPool(cfg_path, client_factory=Slow)
+    first = asyncio.create_task(pool.run(None, lambda c: c.launch("netflix")))
+    await asyncio.sleep(0.01)
+    config.update(lambda c: c.add("living", replace(paired, key="rotated")), cfg_path)
+    second = asyncio.create_task(pool.run(None, lambda c: c.launch("youtube")))
+    await asyncio.sleep(0.01)
+    release.set()
+    assert await first == "Netflix"
+    assert await second == "YouTube"
+    assert last_client().client_key == "rotated"
+    await pool.close()
+    assert not any(client.connected for client in FakeClient.instances)
+
+
+async def test_pool_closes_connections_to_removed_tvs(
+    network: Network, paired: TvEntry, cfg_path: Path
+) -> None:
+    network.reachable_hosts.add("192.168.4.41")
+    config.update(lambda c: c.add("bedroom", TvEntry(host="192.168.4.41", key="k2")), cfg_path)
+    pool = ControllerPool(cfg_path, client_factory=FakeClient)
+    await pool.run("living", lambda c: c.launch("netflix"))
+    living = last_client()
+    config.update(lambda c: c.remove("living"), cfg_path)
+    await pool.run("bedroom", lambda c: c.launch("netflix"))
+    assert not living.connected
     await pool.close()
 
 

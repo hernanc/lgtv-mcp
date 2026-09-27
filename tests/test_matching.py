@@ -52,6 +52,19 @@ def test_empty_query_is_not_found() -> None:
         pick("  ", APPS, "app")
 
 
+def test_accents_are_folded() -> None:
+    assert pick("musica", {"a": "Música", "b": "Fotos y vídeos"}, "app") == "a"
+    assert pick("videos", {"a": "Música", "b": "Fotos y vídeos"}, "app") == "b"
+
+
+def test_names_in_other_scripts_match() -> None:
+    apps = {"coupang": "쿠팡플레이", "kinopoisk": "Кинопоиск", "amediateka": "Amediateka HD"}
+    assert pick("쿠팡플레이", apps, "app") == "coupang"
+    assert pick("кинопоиск", apps, "app") == "kinopoisk"
+    with pytest.raises(NotFound):  # used to shrink to 'hd' and open Amediateka
+        pick("Кинопоиск HD", apps, "app")
+
+
 def test_ambiguous_caps_candidate_list() -> None:
     items = {f"id{i}": f"App {i}" for i in range(30)}
     with pytest.raises(Ambiguous) as err:

@@ -76,11 +76,12 @@ used when it is omitted.
 | `set_volume`, `set_mute` | Volume 0 to 100 or one step up/down; mute |
 | `power` | On (network wake or Wake-on-LAN) or off |
 | `set_screen` | Picture off while sound keeps playing |
-| `press_keys` | Remote buttons: home, back, arrows, enter, play, pause... |
+| `press_keys` | Remote buttons: home, back, arrows, enter, play, pause... (power is left to `power`) |
 | `show_message` | Show a notification on the TV |
 
-Read-only tools are annotated as such, and `power` and `set_tv_address` are
-marked destructive, so clients can auto-approve reads and ask before those.
+Read-only tools are annotated as such, and `power`, `pair_tv` and
+`set_tv_address` are marked destructive, so clients can auto-approve reads and
+ask before those.
 
 ## Command line
 
@@ -136,17 +137,23 @@ altogether.
 - **The pairing key is a password for your TV.** Anyone with it can control
   the TV from your network. It lives only in the config file, which is created
   with owner-only permissions (`0600`), and is never printed, logged or
-  returned by any tool. `lgtv remove NAME` deletes it locally. Most webOS
+  returned by any tool. `lgtv remove NAME` deletes it locally. (If you used
+  an earlier single-TV script, its `key` and `host` files are imported but
+  left in place, since that script may still need them; delete them once
+  you no longer do.) Most webOS
   versions have no per-device revoke; resetting the TV to its initial
   settings clears every pairing.
 - **Local network only.** The tool refuses to pair with or connect to any
   address outside the private IPv4 ranges (10.x, 172.16-31.x, 192.168.x),
   link-local or loopback, so a prompt cannot point it at an internet host.
-  Hostnames must resolve only to such addresses. SSDP location URLs are never
-  fetched.
+  The connection never follows redirects, and the TV's own input socket must
+  be in those ranges too. The MCP tools take IP addresses only, so a prompt
+  cannot make the tool look up a name in DNS; on the command line, hostnames
+  must resolve only to local addresses. SSDP location URLs are never fetched.
 - **The key only goes where you said.** Pairing under an existing name needs
   an explicit `replace`, and a TV that changes address is never followed
-  without your confirmation.
+  without your confirmation. A device at the saved address that reports a
+  different id than the paired TV is refused.
 - **Traffic to the TV is not authenticated.** LG TVs expose their control API
   over plain WebSocket (port 3000) or TLS with a self-signed certificate (port
   3001), so the connection cannot be verified. Use it on a network you trust.

@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, TypeVar
 
 import aiohttp
@@ -24,7 +25,14 @@ from aiowebostv.exceptions import (
 
 from . import config
 from .config import TvEntry
-from .discovery import discover, normalize_mac, reachable, validate_host_async, wake_on_lan
+from .discovery import (
+    discover,
+    local_ipv4,
+    normalize_mac,
+    reachable,
+    validate_host_async,
+    wake_on_lan,
+)
 from .errors import (
     ConnectionLost,
     InvalidInput,
@@ -47,7 +55,9 @@ ClientFactory = Callable[[str, str | None], Any]
 
 LIVE_TV_APP_ID = "com.webos.app.livetv"
 SYSTEM_APPS = {LIVE_TV_APP_ID: "Live TV"}
-KEYS = frozenset(BUTTONS)
+# POWER is left out so that turning the TV off always goes through the power
+# tool, which clients can ask about before running.
+KEYS = frozenset(BUTTONS) - {"POWER"}
 CONNECT_TIMEOUT = 10.0
 OPERATION_TIMEOUT = 20.0
 PAIR_TIMEOUT = 60.0
@@ -55,6 +65,45 @@ MAX_TOAST = 200
 MAX_KEYS = 20
 _KEY_GAP = 0.15
 _TOAST_URI = "system.notifications/createToast"
+
+# What client.connect() raises when the TV cannot be reached or breaks off the
+# handshake. aiohttp raises WSMessageTypeError, a TypeError, when the socket
+# closes mid-handshake, and aiowebostv indexes the TV's replies directly.
+_CONNECT_ERRORS = (OSError, ValueError, TypeError, KeyError, aiohttp.ClientError, WebOsTvError)
+
+
+def _default_client(host: str, client_key: str | None) -> Any:
+    """A WebOsClient whose HTTP session only reaches local IPv4 hosts.
+
+    The TV answers the WebSocket upgrade and names the URL of its input socket
+    itself, so without this a device at an allowed address could redirect the
+    connection, including the registration that carries the key, anywhere.
+    """
+    trace = aiohttp.TraceConfig()
+    trace.on_request_start.append(_refuse_outside_hosts)
+    trace.on_request_redirect.append(_refuse_redirects)
+    session = aiohttp.ClientSession(trace_configs=[trace])
+    return WebOsClient(host, client_key, client_session=session)
+
+
+async def _refuse_outside_hosts(
+    _session: aiohttp.ClientSession,
+    _ctx: SimpleNamespace,
+    params: aiohttp.TraceRequestStartParams,
+) -> None:
+    if local_ipv4(params.url.host or "") is None:
+        raise aiohttp.ClientConnectionError(
+            f"Refusing to connect to {params.url.host}: not on the local network."
+        )
+
+
+async def _refuse_redirects(
+    _session: aiohttp.ClientSession,
+    _ctx: SimpleNamespace,
+    params: aiohttp.TraceRequestRedirectParams,
+) -> None:
+    params.response.close()
+    raise aiohttp.ClientConnectionError("The TV tried to redirect the connection.")
 
 
 class TvController:
@@ -66,7 +115,7 @@ class TvController:
         entry: TvEntry,
         *,
         config_path: Path | None = None,
-        client_factory: ClientFactory = WebOsClient,
+        client_factory: ClientFactory = _default_client,
     ) -> None:
         self.name = name
         self.entry = entry
@@ -93,14 +142,28 @@ class TvController:
             raise PairingFailed(
                 f"TV '{self.name}' rejected the saved pairing key. Pair it again."
             ) from err
-        except (TimeoutError, OSError, ValueError, aiohttp.ClientError, WebOsTvError) as err:
+        except TimeoutError as err:
+            await _disconnect(client)
+            raise Unreachable(
+                f"TV '{self.name}' at {host} did not finish connecting. If it shows a "
+                "connection prompt, accept it with the remote and try again."
+            ) from err
+        except _CONNECT_ERRORS as err:
             await _disconnect(client)
             raise Unreachable(f"Could not connect to TV '{self.name}' at {host}.") from err
         except BaseException:  # cancellation or a bug: never leave the socket open
             await _disconnect(client)
             raise
+        identity = _identity(client)
+        if self.entry.uuid and identity["uuid"] and identity["uuid"] != self.entry.uuid:
+            await _disconnect(client)
+            raise Unreachable(
+                f"The device at {host} is not TV '{self.name}' (it reports a different id). "
+                "If the TV's address changed, confirm the new one with lgtv move or "
+                "set_tv_address."
+            )
         self._client = client
-        self._backfill_identity()
+        self._record(identity)
 
     async def close(self) -> None:
         client, self._client = self._client, None
@@ -112,38 +175,53 @@ class TvController:
         if await asyncio.to_thread(reachable, host):
             return host
         if self.entry.uuid:
-            for found in await asyncio.to_thread(discover):
-                if found.uuid == self.entry.uuid and found.host != host:
-                    raise TvMoved(self.name, host, found.host)
+            try:
+                found = await asyncio.to_thread(discover)
+            except LgtvError:  # the search itself failed; report the TV as unreachable
+                found = []
+            for tv in found:
+                if tv.uuid == self.entry.uuid and tv.host != host:
+                    raise TvMoved(self.name, host, tv.host)
         raise Unreachable(
             f"TV '{self.name}' is not reachable (last seen at {host}). "
             "It may be off or on another network."
         )
 
-    def _backfill_identity(self) -> None:
-        """Record uuid, model and MACs for TVs imported without them."""
-        identity = _identity(self._client)
-        updated = replace(
-            self.entry,
-            uuid=self.entry.uuid or identity["uuid"],
-            model=self.entry.model or identity["model"],
-            macs=self.entry.macs or identity["macs"],
-        )
-        if updated != self.entry:
-            self._save(updated)
+    def _record(self, identity: dict[str, Any]) -> None:
+        """Save a key the TV issued on this connect (it prompts again when it no
+        longer knows the saved one) and identity that older entries lack.
 
-    def _save(self, entry: TvEntry) -> None:
-        self.entry = entry
+        Only those fields are merged into the saved entry, so a host changed
+        meanwhile (lgtv move, set_tv_address) is kept.
+        """
+        old = self.entry
+        new = replace(
+            old,
+            key=self._client.client_key or old.key,
+            uuid=old.uuid or identity["uuid"],
+            model=old.model or identity["model"],
+            macs=old.macs or identity["macs"],
+        )
+        if new == old:
+            return
 
         def apply(cfg: config.Config) -> None:
             current = cfg.tvs.get(self.name)
-            if current is not None and current.key == entry.key:
-                cfg.tvs[self.name] = entry
+            if current is not None and current.key == old.key:  # not re-paired meanwhile
+                cfg.tvs[self.name] = replace(
+                    current,
+                    key=new.key,
+                    uuid=current.uuid or new.uuid,
+                    model=current.model or new.model,
+                    macs=current.macs or new.macs,
+                )
 
         try:
             config.update(apply, self._config_path)
         except (OSError, LgtvError) as err:
             log.warning("Could not update config for TV '%s': %s", self.name, err)
+            new = replace(new, key=old.key)  # keep matching the saved key the pool compares
+        self.entry = new
 
     # --- reads ----------------------------------------------------------------
 
@@ -279,11 +357,11 @@ class TvController:
         if unknown:
             known = ", ".join(sorted(k.lower() for k in KEYS))
             raise NotFound(f"Unknown key(s): {', '.join(unknown)}. Known keys: {known}.")
-        self._connected()
+        client = self._connected()
         for i, button in enumerate(buttons):
             if i:
                 await asyncio.sleep(_KEY_GAP)
-            await self._call(self._client.button(button))
+            await self._call(client.button(button))
         return buttons
 
     async def toast(self, text: str) -> str:
@@ -329,28 +407,50 @@ class TvController:
     async def _call(self, awaitable: Awaitable[T]) -> T:
         try:
             return await awaitable
+        except asyncio.CancelledError as err:
+            # aiowebostv cancels the pending reply when the TV's socket closes. Only a
+            # cancellation of this task itself (a timeout, shutdown) may propagate: a
+            # stray one would end the MCP server's whole session. The request may
+            # have been delivered, so this is not retried.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            raise Unreachable(
+                f"Lost the connection to TV '{self.name}' before it answered. "
+                "The action may or may not have happened."
+            ) from err
         except WebOsTvServiceNotFoundError as err:
             raise LgtvError("This TV does not support that action.") from err
         except WebOsTvResponseTypeError as err:
-            if "401" in str(err):
+            if _error_text(err).startswith("401"):
                 raise PermissionDenied() from err
             raise LgtvError("The TV rejected the request.") from err
         except WebOsTvCommandTimeoutError as err:
             raise Unreachable(f"TV '{self.name}' did not respond in time.") from err
         except WebOsTvCommandError as err:
-            # aiowebostv raises this both for "Not connected" and for requests the TV
-            # refused (returnValue false); only the former is worth a reconnect.
-            if "not connected" in str(err).lower():
+            # aiowebostv raises this both for "Not connected, ..." before sending and
+            # for requests the TV refused (returnValue false); only the former is worth
+            # a reconnect. A refusal's text comes from the TV, so match the prefix.
+            if str(err).startswith("Not connected"):
                 raise ConnectionLost(f"Lost the connection to TV '{self.name}'.") from err
             raise Rejected() from err
         except (aiohttp.ClientError, ConnectionError) as err:
             raise ConnectionLost(f"Lost the connection to TV '{self.name}'.") from err
 
 
+def _error_text(err: WebOsTvResponseTypeError) -> str:
+    """The TV's error string, such as '401 insufficient permissions'.
+
+    str(err) is the whole reply, request id and TV-provided text included.
+    """
+    reply = err.args[0] if err.args else None
+    return str(reply.get("error", "")) if isinstance(reply, dict) else str(reply or "")
+
+
 async def pair(
     host: str,
     *,
-    client_factory: ClientFactory = WebOsClient,
+    client_factory: ClientFactory = _default_client,
     timeout: float = PAIR_TIMEOUT,
 ) -> TvEntry:
     """Pair with the TV at ``host``. Someone must accept the prompt on the TV."""
@@ -369,7 +469,7 @@ async def pair(
             "Pairing was cancelled or timed out on the TV. "
             "Retry while someone is at the TV to accept the prompt."
         ) from err
-    except (OSError, ValueError, aiohttp.ClientError, WebOsTvError) as err:
+    except _CONNECT_ERRORS as err:
         raise Unreachable(f"Lost the connection to {host} while pairing.") from err
     finally:
         await _disconnect(client)
@@ -425,6 +525,11 @@ def _identity(client: Any) -> dict[str, Any]:
 async def _disconnect(client: Any) -> None:
     with suppress(Exception):
         await client.disconnect()
+    # aiowebostv only closes sessions it created itself; _default_client passes one in.
+    session = getattr(client, "client_session", None)
+    if isinstance(session, aiohttp.ClientSession) and not session.closed:
+        with suppress(Exception):
+            await session.close()
 
 
 def ensure_can_add(cfg: config.Config, name: str, *, replace: bool) -> None:
@@ -481,7 +586,7 @@ class ControllerPool:
     def __init__(
         self,
         config_path: Path | None = None,
-        client_factory: ClientFactory = WebOsClient,
+        client_factory: ClientFactory = _default_client,
     ) -> None:
         self.config_path = config_path
         self._factory = client_factory
@@ -507,9 +612,14 @@ class ControllerPool:
         once, unless ``retry`` is False (for operations that are not safe to
         repeat after a partial send, like key sequences or volume steps).
         """
-        controller = await self._controller(tv)
+        cfg = self.load_config()
+        name, entry = cfg.get(tv)
+        await self._forget_removed(cfg)
         attempts = 2 if retry else 1
-        async with self._locks.setdefault(controller.name, asyncio.Lock()):
+        # The controller is looked up, replaced and closed only under its TV's lock,
+        # so a call can never lose its connection to another call.
+        async with self._lock(name):
+            controller = await self._controller(name, entry)
             try:
                 async with asyncio.timeout(timeout):
                     for attempt in range(1, attempts + 1):
@@ -523,12 +633,20 @@ class ControllerPool:
                                 raise
                     raise AssertionError("unreachable")  # pragma: no cover
             except TimeoutError as err:
-                raise Unreachable(f"TV '{controller.name}' did not respond in time.") from err
+                raise Unreachable(f"TV '{name}' did not respond in time.") from err
 
-    async def _controller(self, tv: str | None) -> TvController:
-        name, entry = self.load_config().get(tv)
+    def _lock(self, name: str) -> asyncio.Lock:
+        return self._locks.setdefault(name, asyncio.Lock())
+
+    async def _controller(self, name: str, entry: TvEntry) -> TvController:
+        """The pooled controller for a TV. Call with that TV's lock held."""
         controller = self._controllers.get(name)
-        if controller is not None and controller.entry != entry:
+        # Only the address and key matter to an open connection. The identity
+        # fields can differ, for example when saving them failed.
+        if controller is not None and (controller.entry.host, controller.entry.key) != (
+            entry.host,
+            entry.key,
+        ):
             await controller.close()
             controller = None
         if controller is None:
@@ -537,6 +655,12 @@ class ControllerPool:
             )
             self._controllers[name] = controller
         return controller
+
+    async def _forget_removed(self, cfg: config.Config) -> None:
+        """Close idle connections to TVs that were removed from the config."""
+        for name in list(self._controllers):
+            if name not in cfg.tvs and not self._lock(name).locked():
+                await self._controllers.pop(name).close()
 
     async def start_pairing(
         self, host: str, name: str, *, make_default: bool, replace: bool = False
@@ -583,15 +707,17 @@ class ControllerPool:
     async def move(self, name: str, host: str) -> str:
         """Point a paired TV at a new address, after a person confirmed it."""
         new_host = await move_tv(name, host, self.config_path)
-        controller = self._controllers.pop(name, None)
-        if controller is not None:
-            await controller.close()
+        async with self._lock(name):
+            controller = self._controllers.pop(name, None)
+            if controller is not None:
+                await controller.close()
         return new_host
 
     async def close(self) -> None:
         for job in self._pairings.values():
             if job.task is not None and not job.task.done():
                 job.task.cancel()
-        for controller in self._controllers.values():
-            await controller.close()
+        controllers = list(self._controllers.values())
         self._controllers.clear()
+        for controller in controllers:
+            await controller.close()

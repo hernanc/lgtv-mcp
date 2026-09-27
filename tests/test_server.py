@@ -5,6 +5,7 @@ exited in the same task, which a yield fixture cannot guarantee.
 """
 
 import asyncio
+import socket
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -76,7 +77,11 @@ async def test_lists_expected_tools_with_annotations(pool: ControllerPool) -> No
     assert tools["get_status"].annotations.read_only_hint is True
     assert tools["power"].annotations.destructive_hint is True
     assert tools["set_tv_address"].annotations.destructive_hint is True
+    assert tools["pair_tv"].annotations.destructive_hint is True  # replace=True drops a key
+    assert tools["discover_tvs"].annotations.open_world_hint is True
     assert tools["show_message"].annotations.read_only_hint is False
+    for name in ("get_status", "list_apps", "list_inputs", "discover_tvs"):
+        assert "not instructions" in (tools[name].description or ""), name
 
 
 async def test_schema_limits(pool: ControllerPool) -> None:
@@ -190,12 +195,33 @@ async def test_volume_requires_exactly_one_argument(pool: ControllerPool, paired
         ("press_keys", {"keys": ["home"] * 21}),
         ("power", {"state": "reboot"}),
         ("get_status", {"tv": "x" * 33}),
+        ("set_volume", {"level": True}),
+        ("set_volume", {"level": False}),
     ],
 )
 async def test_schema_validation_rejects(
     pool: ControllerPool, paired: TvEntry, tool: str, args: dict[str, Any]
 ) -> None:
     assert (await call(pool, tool, args)).is_error
+    assert not [c for tv in FakeClient.instances for c in tv.calls if c[0] == "set_volume"]
+
+
+async def test_host_tools_never_look_up_names(
+    pool: ControllerPool, paired: TvEntry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    looked_up: list[object] = []
+
+    def getaddrinfo(*args: object, **kwargs: object) -> list[object]:
+        looked_up.append(args)
+        return []
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    for tool, args in (
+        ("pair_tv", {"host": "c2VjcmV0.x7.attacker.example", "name": "x"}),
+        ("set_tv_address", {"name": "living", "host": "tv.attacker.example"}),
+    ):
+        assert (await call(pool, tool, args)).is_error, tool
+    assert looked_up == []
 
 
 async def test_power_off_and_on(pool: ControllerPool, paired: TvEntry, network: Network) -> None:

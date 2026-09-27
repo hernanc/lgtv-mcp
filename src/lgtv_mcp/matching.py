@@ -1,6 +1,5 @@
 """Forgiving name matching for apps and inputs, and cleanup of TV-provided text."""
 
-import re
 import unicodedata
 
 from .errors import Ambiguous, NotFound
@@ -47,4 +46,6 @@ def clean_text(value: object) -> str:
 
 
 def _norm(value: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", value.lower())
+    """Letters and digits only, in any script, lowercase and without accents."""
+    decomposed = unicodedata.normalize("NFKD", value).casefold()
+    return "".join(ch for ch in decomposed if ch.isalnum())

@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import io
 import json
 import logging
 import sys
@@ -316,8 +317,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         sys.exit(f"lgtv: {err}")
     except KeyboardInterrupt:
         sys.exit(130)
+    # TV-provided text can hold characters the output encoding lacks (Windows uses
+    # the ANSI code page when output is redirected). Escape them instead of failing
+    # after the TV has already acted; JSON uses its own ASCII escapes.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(errors="backslashreplace")
     if args.json:
-        print(json.dumps(data, indent=2, ensure_ascii=False))
+        print(json.dumps(data, indent=2))
     elif text:
         print(text)
 

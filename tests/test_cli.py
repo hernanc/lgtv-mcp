@@ -1,4 +1,6 @@
+import io
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -195,6 +197,28 @@ def test_json_output_for_actions(
 ) -> None:
     data = json.loads(run(capsys, "--json", *argv))
     assert "message" in data
+
+
+KOREAN_APPS = {"coupang": {"title": "쿠팡플레이"}}
+
+
+def test_json_output_is_ascii(capsys: pytest.CaptureFixture[str], paired: TvEntry) -> None:
+    FakeClient.state_overrides = {"apps": KOREAN_APPS}
+    out = run(capsys, "--json", "apps")
+    assert out.isascii()
+    assert {"id": "coupang", "title": "쿠팡플레이"} in json.loads(out)
+
+
+def test_text_output_survives_a_narrow_encoding(
+    monkeypatch: pytest.MonkeyPatch, paired: TvEntry
+) -> None:
+    # Windows writes redirected output in the ANSI code page, e.g. cp1252.
+    FakeClient.state_overrides = {"apps": KOREAN_APPS}
+    buffer = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(buffer, encoding="cp1252"))
+    cli.main(["apps"])
+    sys.stdout.flush()
+    assert b"coupang" in buffer.getvalue()
 
 
 def test_abbreviated_options_are_rejected(paired: TvEntry) -> None:

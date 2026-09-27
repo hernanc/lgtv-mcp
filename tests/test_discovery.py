@@ -1,10 +1,12 @@
+import contextlib
+import errno
 import socket
 
 import pytest
 
 from lgtv_mcp import discovery
 from lgtv_mcp.discovery import Found, magic_packet, normalize_mac, parse_ssdp, validate_host
-from lgtv_mcp.errors import InvalidInput
+from lgtv_mcp.errors import InvalidInput, Unreachable
 
 LG_REPLY = (
     b"HTTP/1.1 200 OK\r\n"
@@ -200,3 +202,61 @@ def test_wake_on_lan_sends_broadcast_and_unicast(monkeypatch: pytest.MonkeyPatch
 def test_wake_on_lan_requires_a_mac() -> None:
     with pytest.raises(InvalidInput, match="MAC"):
         discovery.wake_on_lan([], "192.168.4.40")
+
+
+def failing_socket(unreachable: set[str]) -> type[FakeSocket]:
+    class FailingSocket(FakeSocket):
+        def sendto(self, data: bytes, addr: tuple[str, int]) -> None:
+            if addr[0] in unreachable:
+                raise OSError(errno.EHOSTUNREACH, "No route to host")
+            super().sendto(data, addr)
+
+    return FailingSocket
+
+
+def test_wake_on_lan_keeps_sending_after_a_failed_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(discovery.socket, "socket", failing_socket({"255.255.255.255"}))
+    discovery.wake_on_lan(["02:ab:cd:00:00:01", "02:ab:cd:00:00:02"], "192.168.4.40")
+    assert [addr for _, addr in FakeSocket.sent] == [("192.168.4.40", 9)] * 2
+
+
+def test_wake_on_lan_fails_when_nothing_was_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        discovery.socket, "socket", failing_socket({"255.255.255.255", "192.168.4.40"})
+    )
+    with pytest.raises(Unreachable, match="No route to host"):
+        discovery.wake_on_lan(["02:ab:cd:00:00:01"], "192.168.4.40")
+
+
+def test_discover_reports_network_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(discovery.socket, "socket", failing_socket({discovery.SSDP_ADDR[0]}))
+    with pytest.raises(Unreachable, match="Cannot search the local network"):
+        discovery.discover(timeout=0.01)
+
+
+def test_reachable_tries_tls_port_when_plain_port_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tried: list[int] = []
+
+    def connect(address: tuple[str, int], timeout: float) -> contextlib.nullcontext[None]:
+        tried.append(address[1])
+        if address[1] == 3000:
+            raise ConnectionRefusedError
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(socket, "create_connection", connect)
+    assert discovery.reachable("192.168.4.40")
+    assert tried == [3000, 3001]
+
+
+def test_reachable_probes_once_when_the_tv_is_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    tried: list[int] = []
+
+    def connect(address: tuple[str, int], timeout: float) -> None:
+        tried.append(address[1])
+        raise TimeoutError
+
+    monkeypatch.setattr(socket, "create_connection", connect)
+    assert not discovery.reachable("192.168.4.40")
+    assert tried == [3000]

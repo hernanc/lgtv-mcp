@@ -12,12 +12,12 @@ import socket
 import time
 from dataclasses import dataclass
 
-from .errors import InvalidInput
+from .errors import InvalidInput, Unreachable
 from .matching import clean_text
 
 SSDP_ADDR = ("239.255.255.250", 1900)
 WEBOS_ST = "urn:lge-com:service:webos-second-screen:1"
-WEBOS_PORT = 3000
+WEBOS_PORTS = (3000, 3001)  # plain WebSocket, then TLS (which aiowebostv falls back to)
 WOL_PORT = 9
 _MAX_DATAGRAM = 4096
 _HOSTNAME = re.compile(r"(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9-]+)*\.?")
@@ -49,25 +49,34 @@ def discover(timeout: float = 3.0) -> list[Found]:
         f"ST: {WEBOS_ST}\r\n\r\n"
     ).encode()
     found: dict[str, Found] = {}
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-        for _ in range(2):  # UDP is lossy; a second probe is cheap
-            sock.sendto(request, SSDP_ADDR)
-        deadline = time.monotonic() + timeout
-        while (remaining := deadline - time.monotonic()) > 0:
-            sock.settimeout(remaining)
-            try:
-                data, (host, _port) = sock.recvfrom(_MAX_DATAGRAM)
-            except TimeoutError:
-                break
-            if host not in found and (tv := parse_ssdp(data, host)):
-                found[host] = tv
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            for _ in range(2):  # UDP is lossy; a second probe is cheap
+                sock.sendto(request, SSDP_ADDR)
+            deadline = time.monotonic() + timeout
+            while (remaining := deadline - time.monotonic()) > 0:
+                sock.settimeout(remaining)
+                try:
+                    data, (host, _port) = sock.recvfrom(_MAX_DATAGRAM)
+                except TimeoutError:
+                    break
+                except OSError:  # one bad datagram (Windows raises on oversized ones)
+                    continue
+                if host not in found and (tv := parse_ssdp(data, host)):
+                    found[host] = tv
+    except OSError as err:
+        raise Unreachable(
+            f"Cannot search the local network ({err.strerror or err}). Check that this "
+            "computer is on the TV's network; on macOS, allow Local Network access for "
+            "this app in System Settings."
+        ) from err
     return sorted(found.values(), key=lambda f: ipaddress.IPv4Address(f.host))
 
 
 def parse_ssdp(data: bytes, host: str) -> Found | None:
     """Return a Found for an SSDP reply from a webOS TV on the local network."""
-    if _local_ipv4(host) is None:
+    if local_ipv4(host) is None:
         return None
     text = data[:_MAX_DATAGRAM].decode("utf-8", errors="replace")
     lines = text.split("\r\n")
@@ -86,13 +95,21 @@ def parse_ssdp(data: bytes, host: str) -> Found | None:
     return Found(host=host, uuid=clean_text(uuid) or None, server=clean_text(server))
 
 
-def reachable(host: str, port: int = WEBOS_PORT, timeout: float = 1.5) -> bool:
-    """True if the TV accepts TCP connections on its control port. Blocking."""
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+def reachable(host: str, timeout: float = 1.5) -> bool:
+    """True if the TV accepts TCP connections on a control port. Blocking.
+
+    The TLS port is only tried when the plain one is refused (firmware that
+    serves only TLS), so a TV that is off costs a single timeout.
+    """
+    for port in WEBOS_PORTS:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except ConnectionRefusedError:
+            continue
+        except OSError:
+            return False
+    return False
 
 
 def validate_host(host: str) -> str:
@@ -140,18 +157,31 @@ def magic_packet(mac: str) -> bytes:
 
 
 def wake_on_lan(macs: list[str], host: str | None = None) -> None:
-    """Send Wake-on-LAN magic packets to the broadcast address and the last known IP."""
+    """Send Wake-on-LAN magic packets to the broadcast address and the last known IP.
+
+    A failed send (no broadcast route, or macOS reporting the powered-off TV's
+    IP as down) does not stop the others; only failing every send is an error.
+    """
     packets = [magic_packet(mac) for mac in macs]
     if not packets:
         raise InvalidInput("No MAC address saved for this TV, so it cannot be woken up.")
     targets = [("255.255.255.255", WOL_PORT)]
     if host:
         targets.append((validate_host(host), WOL_PORT))
+    sent, failure = 0, None
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         for packet in packets:
             for target in targets:
-                sock.sendto(packet, target)
+                try:
+                    sock.sendto(packet, target)
+                    sent += 1
+                except OSError as err:
+                    failure = err
+    if not sent and failure is not None:
+        raise Unreachable(
+            f"Could not send Wake-on-LAN ({failure.strerror or failure})."
+        ) from failure
 
 
 def _parse_ipv4(value: str) -> ipaddress.IPv4Address | None:
@@ -165,7 +195,8 @@ def _parse_ipv4(value: str) -> ipaddress.IPv4Address | None:
     return ip
 
 
-def _local_ipv4(value: str) -> ipaddress.IPv4Address | None:
+def local_ipv4(value: str) -> ipaddress.IPv4Address | None:
+    """The address if ``value`` is an allowlisted IPv4 literal. Never resolves names."""
     ip = _parse_ipv4(value)
     return ip if ip is not None and _is_local(ip) else None
 
